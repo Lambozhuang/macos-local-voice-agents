@@ -38,6 +38,17 @@ app = FastAPI()
 
 pcs_map: Dict[str, SmallWebRTCConnection] = {}
 
+# Kokoro voices the client may request via the /api/offer "voice" field. An
+# unknown id falls back to the default so a bad request can't crash the worker
+# (the Kokoro worker errors on an unknown voice during its test generation).
+ALLOWED_VOICES = {
+    "af_heart", "af_bella", "af_nicole", "af_aoede", "af_kore", "af_sarah",
+    "am_michael", "am_fenrir", "am_puck", "am_echo", "am_eric", "am_liam",
+    "bf_emma", "bf_isabella", "bf_alice", "bf_lily",
+    "bm_george", "bm_fable", "bm_lewis", "bm_daniel",
+}
+DEFAULT_VOICE = "af_heart"
+
 ice_servers = [
     IceServer(
         urls="stun:stun.l.google.com:19302",
@@ -58,7 +69,7 @@ Start the conversation by saying, "Hello, I'm Pipecat!" Then stop and wait for t
 """
 
 
-async def run_bot(webrtc_connection):
+async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE):
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
@@ -74,7 +85,7 @@ async def run_bot(webrtc_connection):
 
     stt = WhisperSTTServiceMLX(model=MLXModel.LARGE_V3_TURBO_Q4)
 
-    tts = TTSMLXIsolated(model="mlx-community/Kokoro-82M-bf16", voice="af_heart", sample_rate=24000)
+    tts = TTSMLXIsolated(model="mlx-community/Kokoro-82M-bf16", voice=voice, sample_rate=24000)
     # tts = TTSMLXIsolated(model="Marvis-AI/marvis-tts-250m-v0.1", voice=None)
 
     llm = OpenAILLMService(
@@ -173,7 +184,10 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
             pcs_map.pop(webrtc_connection.pc_id, None)
 
         # Run example function with SmallWebRTC transport arguments.
-        background_tasks.add_task(run_bot, pipecat_connection)
+        voice = request.get("voice", DEFAULT_VOICE)
+        if voice not in ALLOWED_VOICES:
+            voice = DEFAULT_VOICE
+        background_tasks.add_task(run_bot, pipecat_connection, voice)
 
     answer = pipecat_connection.get_answer()
     # Updating the peer connection inside the map
