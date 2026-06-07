@@ -41,13 +41,8 @@ pcs_map: Dict[str, SmallWebRTCConnection] = {}
 # Kokoro voices the client may request via the /api/offer "voice" field. An
 # unknown id falls back to the default so a bad request can't crash the worker
 # (the Kokoro worker errors on an unknown voice during its test generation).
-ALLOWED_VOICES = {
-    "af_heart", "af_bella", "af_nicole", "af_aoede", "af_kore", "af_sarah",
-    "am_michael", "am_fenrir", "am_puck", "am_echo", "am_eric", "am_liam",
-    "bf_emma", "bf_isabella", "bf_alice", "bf_lily",
-    "bm_george", "bm_fable", "bm_lewis", "bm_daniel",
-}
-DEFAULT_VOICE = "af_heart"
+# Single source of truth in voices.py (shared with prewarm.py).
+from voices import ALLOWED_VOICES, DEFAULT_VOICE
 
 ice_servers = [
     IceServer(
