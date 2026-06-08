@@ -59,8 +59,8 @@ def _p(mod, role):
 AGENTS = {
     "t0": {"prompt": _p(_training, "agent1"), "voice": "bm_george"},   # Training (Alfred)        <- en-GB-Ryan
     "t1": {"prompt": _p(_city,     "agent1"), "voice": "af_aoede"},     # City friend             <- en-US-Ava
-    "t2": {"prompt": _p(_city,     "agent2"), "voice": "af_bella"},     # City clerk              (swapped with t3)
-    "t3": {"prompt": _p(_city,     "agent3"), "voice": "am_michael"},   # City manager            (swapped with t2)
+    "t2": {"prompt": _p(_city,     "agent2"), "voice": "am_michael"},   # City clerk              <- en-US-Andrew
+    "t3": {"prompt": _p(_city,     "agent3"), "voice": "af_bella"},     # City manager            <- en-US-Aria
     "t4": {"prompt": _p(_hotel,    "agent1"), "voice": "af_heart"},     # Hotel receptionist      <- en-US-Michelle
     "t5": {"prompt": _p(_hotel,    "agent2"), "voice": "am_fenrir"},    # Hotel maintenance       <- en-US-Guy
     "t6": {"prompt": _p(_hotel,    "agent3"), "voice": "am_puck"},      # Hotel waiter            <- en-US-Brian
