@@ -44,6 +44,10 @@ pcs_map: Dict[str, SmallWebRTCConnection] = {}
 # Single source of truth in voices.py (shared with prewarm.py).
 from voices import ALLOWED_VOICES, DEFAULT_VOICE
 
+# Per-agent persona + default voice, keyed by agent_id (t0..t9) which Unity sends
+# in the /api/offer. Ported from the legacy transition_prompts_*.py role prompts.
+from agents_config import AGENTS, DEFAULT_AGENT
+
 ice_servers = [
     IceServer(
         urls="stun:stun.l.google.com:19302",
@@ -64,7 +68,7 @@ Start the conversation by saying, "Hello, I'm Pipecat!" Then stop and wait for t
 """
 
 
-async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE):
+async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str = DEFAULT_AGENT):
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
@@ -92,11 +96,13 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE):
         max_tokens=4096,
     )
 
+    # Per-agent persona (selected by agent_id); falls back to the default agent.
+    system_prompt = AGENTS.get(agent_id, AGENTS[DEFAULT_AGENT])["prompt"]
     context = OpenAILLMContext(
         [
             {
                 "role": "user",
-                "content": SYSTEM_INSTRUCTION,
+                "content": system_prompt,
             }
         ],
     )
@@ -179,10 +185,19 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
             pcs_map.pop(webrtc_connection.pc_id, None)
 
         # Run example function with SmallWebRTC transport arguments.
-        voice = request.get("voice", DEFAULT_VOICE)
-        if voice not in ALLOWED_VOICES:
-            voice = DEFAULT_VOICE
-        background_tasks.add_task(run_bot, pipecat_connection, voice)
+        # agent_id (t0..t9) selects the persona + its default voice.
+        agent_id = request.get("agent_id", DEFAULT_AGENT)
+        if agent_id not in AGENTS:
+            agent_id = DEFAULT_AGENT
+        # Explicit non-empty voice in the offer overrides (testing); else use the
+        # agent's default voice from the registry.
+        requested_voice = request.get("voice") or ""
+        if requested_voice in ALLOWED_VOICES:
+            voice = requested_voice
+        else:
+            voice = AGENTS[agent_id]["voice"]
+        logger.info(f"New connection: agent_id={agent_id}, voice={voice}")
+        background_tasks.add_task(run_bot, pipecat_connection, voice, agent_id)
 
     answer = pipecat_connection.get_answer()
     # Updating the peer connection inside the map
