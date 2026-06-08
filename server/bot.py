@@ -32,6 +32,72 @@ from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams
 
 from tts_mlx_isolated import TTSMLXIsolated
 
+import re
+from pipecat.frames.frames import Frame, LLMTextFrame, LLMFullResponseEndFrame
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+
+
+class EndMarkerFilter(FrameProcessor):
+    """Strip the literal <END> farewell marker from LLM text before it reaches TTS,
+    so Kokoro never speaks it. Inserted in the pipeline AFTER the RTVI processor +
+    LLM, so the client still receives <END> in bot-llm-text (its Done-button signal);
+    only the text feeding TTS is cleaned.
+
+    The LLM streams token by token, so the marker may arrive split across
+    LLMTextFrames ('<','END','>'); we buffer the minimal tail that could be a partial
+    marker and flush the rest, then drain on the end-of-response frame. Tolerant of
+    whitespace variants like '< END >'. All non-text frames pass through untouched.
+    """
+
+    _MARKER_RE = re.compile(r"<\s*END\s*>", re.IGNORECASE)
+    _MAXHOLD = len("< END >")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._buf = ""
+
+    async def _emit(self, text: str):
+        if text:
+            await self.push_frame(LLMTextFrame(text))
+
+    async def _scan_and_flush(self, *, final: bool):
+        # Remove any complete markers already in the buffer.
+        while True:
+            m = self._MARKER_RE.search(self._buf)
+            if not m:
+                break
+            self._buf = self._buf[: m.start()] + self._buf[m.end():]
+        if final:
+            await self._emit(self._buf)
+            self._buf = ""
+            return
+        # Hold back only a trailing run that could be the start of a split marker
+        # (e.g. "<", "< E", "< END"); emit everything before it.
+        keep = 0
+        tail = self._buf[-self._MAXHOLD:]
+        for i in range(len(tail)):
+            if re.fullmatch(r"<\s*(E(N(D\s*)?)?)?", tail[i:], re.IGNORECASE):
+                keep = len(tail) - i
+                break
+        if keep:
+            safe, self._buf = self._buf[:-keep], self._buf[-keep:]
+        else:
+            safe, self._buf = self._buf, ""
+        await self._emit(safe)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMTextFrame):
+            self._buf += frame.text
+            await self._scan_and_flush(final=False)
+            return  # swallow the original; cleaned text is re-emitted by _emit
+        if isinstance(frame, LLMFullResponseEndFrame):
+            await self._scan_and_flush(final=True)
+            await self.push_frame(frame, direction)
+            return
+        await self.push_frame(frame, direction)
+
+
 load_dotenv(override=True)
 
 app = FastAPI()
@@ -120,6 +186,8 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str =
     #
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
+    end_filter = EndMarkerFilter()  # strip <END> from text feeding TTS (kept in bot-llm-text for the client)
+
     pipeline = Pipeline(
         [
             transport.input(),
@@ -127,6 +195,7 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str =
             rtvi,
             context_aggregator.user(),
             llm,
+            end_filter,
             tts,
             transport.output(),
             context_aggregator.assistant(),
