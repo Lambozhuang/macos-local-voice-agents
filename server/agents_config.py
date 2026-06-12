@@ -60,11 +60,27 @@ _FACTS_FOOTER = (
 )
 
 _AGENT_FACT_LINES = {
+    # Three training variants (t0/t0b/t0c) share the same Alfred persona + voice;
+    # only these facts differ, so a subject who practices more than once gets a
+    # fresh set of things to find out instead of repeating the same warm-up. Each
+    # mixes the slot types (season/number/time/name) like the real tasks.
     "t0": [
         "Your favourite season is autumn.",
         "You have worked here for 7 years.",
         "Your shift today started at 9 am.",
         "The café you recommend nearby is called the Brookside Café.",
+    ],
+    "t0b": [
+        "Your favourite hobby is painting.",
+        "You speak 3 languages.",
+        "The building opens at 8 am.",
+        "Your cat is named Marble.",
+    ],
+    "t0c": [
+        "Your favourite drink is green tea.",
+        "Your office is on the 5th floor.",
+        "You take your break at 2 pm.",
+        'The book you are reading is called "The Quiet River".',
     ],
     "t1": [
         'Last weekend you saw the movie "The Glass Harbor".',
@@ -150,7 +166,9 @@ def _p(mod, role, agent_id):
 # gender-matched. Museum agent2 (German Florian) and agent3 (HK Yan) have no
 # Kokoro equivalent, approximated with distinct UK voices.
 AGENTS = {
-    "t0": {"prompt": _p(_training, "agent1", "t0"), "voice": "bm_george"},   # Training (Alfred)        <- en-GB-Ryan
+    "t0":  {"prompt": _p(_training, "agent1", "t0"),  "voice": "bm_george"},  # Training 1 (Alfred)      <- en-GB-Ryan
+    "t0b": {"prompt": _p(_training, "agent1", "t0b"), "voice": "bm_george"},  # Training 2 (Alfred, same persona/voice; different facts)
+    "t0c": {"prompt": _p(_training, "agent1", "t0c"), "voice": "bm_george"},  # Training 3 (Alfred, same persona/voice; different facts)
     "t1": {"prompt": _p(_city,     "agent1", "t1"), "voice": "af_aoede"},     # City friend             <- en-US-Ava
     "t2": {"prompt": _p(_city,     "agent2", "t2"), "voice": "am_michael"},   # City clerk              <- en-US-Andrew
     "t3": {"prompt": _p(_city,     "agent3", "t3"), "voice": "af_bella"},     # City manager            <- en-US-Aria
