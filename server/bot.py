@@ -13,22 +13,22 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI
 from loguru import logger
 
-from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
-from pipecat.audio.turn.smart_turn.local_smart_turn_v2 import LocalSmartTurnAnalyzerV2
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.workers.runner import WorkerRunner
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.services.openai.llm import OpenAILLMService
-
 from pipecat.services.whisper.stt import WhisperSTTServiceMLX, MLXModel
 from pipecat.transports.base_transport import TransportParams
-from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
-from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.transports.network.webrtc_connection import IceServer, SmallWebRTCConnection
-from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams
+from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 
 from tts_mlx_isolated import TTSMLXIsolated
 
@@ -140,31 +140,26 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str =
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-            turn_analyzer=LocalSmartTurnAnalyzerV2(
-                smart_turn_model_path="",  # Download from HuggingFace
-                params=SmartTurnParams(),
-            ),
         ),
     )
 
-    stt = WhisperSTTServiceMLX(model=MLXModel.LARGE_V3_TURBO_Q4)
+    stt = WhisperSTTServiceMLX(settings=WhisperSTTServiceMLX.Settings(model=MLXModel.LARGE_V3_TURBO_Q4.value))
 
     tts = TTSMLXIsolated(model="mlx-community/Kokoro-82M-bf16", voice=voice, sample_rate=24000)
     # tts = TTSMLXIsolated(model="Marvis-AI/marvis-tts-250m-v0.1", voice=None)
 
     llm = OpenAILLMService(
         api_key="dummyKey",
-        model="gemma-3n-e4b-it-text",  # Small model. Uses ~4GB of RAM.
-        # model="google/gemma-3-12b",  # Medium-sized model. Uses ~8.5GB of RAM.
-        # model="mlx-community/Qwen3-235B-A22B-Instruct-2507-3bit-DWQ", # Large model. Uses ~110GB of RAM!
         base_url="http://127.0.0.1:1234/v1",
-        max_tokens=4096,
+        settings=OpenAILLMService.Settings(
+            model="local-model",  # LM Studio ignores this; uses whatever is loaded
+            max_tokens=4096,
+        ),
     )
 
     # Per-agent persona (selected by agent_id); falls back to the default agent.
     system_prompt = AGENTS.get(agent_id, AGENTS[DEFAULT_AGENT])["prompt"]
-    context = OpenAILLMContext(
+    context = LLMContext(
         [
             {
                 "role": "user",
@@ -172,19 +167,17 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str =
             }
         ],
     )
-    context_aggregator = llm.create_context_aggregator(
+    context_aggregator = LLMContextAggregatorPair(
         context,
-        # Whisper local service isn't streaming, so it delivers the full text all at
-        # once, after the UserStoppedSpeaking frame. Set aggregation_timeout to a
-        # a de minimus value since we don't expect any transcript aggregation to be
-        # necessary.
-        user_params=LLMUserAggregatorParams(aggregation_timeout=0.05),
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+        ),
     )
 
     #
     # RTVI events for Pipecat client UI
     #
-    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+    rtvi = RTVIProcessor()
 
     end_filter = EndMarkerFilter()  # strip <END> from text feeding TTS (kept in bot-llm-text for the client)
 
@@ -202,34 +195,51 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str =
         ]
     )
 
-    task = PipelineTask(
+    latency_observer = UserBotLatencyObserver()
+
+    @latency_observer.event_handler("on_first_bot_speech_latency")
+    async def on_first_bot_speech_latency(observer, latency_secs):
+        logger.info(f"⏱  First bot speech: {latency_secs:.3f}s after client connect")
+
+    @latency_observer.event_handler("on_latency_measured")
+    async def on_latency_measured(observer, latency_secs):
+        logger.info(f"⏱  User→bot latency: {latency_secs:.3f}s")
+
+    @latency_observer.event_handler("on_latency_breakdown")
+    async def on_latency_breakdown(observer, breakdown):
+        events = breakdown.chronological_events()
+        if events:
+            lines = "\n    ".join(events)
+            logger.info(f"⏱  Breakdown:\n    {lines}")
+
+    task = PipelineWorker(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        observers=[RTVIObserver(rtvi)],
+        observers=[RTVIObserver(rtvi), latency_observer, MetricsLogObserver()],
     )
 
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         await rtvi.set_bot_ready()
         # Kick off the conversation
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
+        await task.queue_frames([LLMRunFrame()])
 
-    @transport.event_handler("on_first_participant_joined")
-    async def on_first_participant_joined(transport, participant):
-        print(f"Participant joined: {participant}")
-        await transport.capture_participant_transcription(participant["id"])
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        print(f"Client connected: {client}")
+        asyncio.create_task(tts.prewarm())
 
-    @transport.event_handler("on_participant_left")
-    async def on_participant_left(transport, participant, reason):
-        print(f"Participant left: {participant}")
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        print(f"Client disconnected: {client}")
         await task.cancel()
 
-    runner = PipelineRunner(handle_sigint=False)
-
-    await runner.run(task)
+    runner = WorkerRunner(handle_sigint=False)
+    await runner.add_workers(task)
+    await runner.run()
 
 
 @app.post("/api/offer")
