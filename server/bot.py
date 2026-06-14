@@ -132,6 +132,7 @@ async def run_bot(webrtc_connection):
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         print(f"Client connected: {client}")
+        asyncio.create_task(tts.prewarm())
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
