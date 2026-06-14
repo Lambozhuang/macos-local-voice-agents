@@ -134,7 +134,7 @@ Start the conversation by saying, "Hello, I'm Pipecat!" Then stop and wait for t
 """
 
 
-async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str = DEFAULT_AGENT):
+async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str | None = None):
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
         params=TransportParams(
@@ -157,8 +157,13 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str =
         ),
     )
 
-    # Per-agent persona (selected by agent_id); falls back to the default agent.
-    system_prompt = AGENTS.get(agent_id, AGENTS[DEFAULT_AGENT])["prompt"]
+    # When Unity sends an agent_id (t0..t9), use that agent's task persona.
+    # When there's no agent_id (e.g. the plain web console), fall back to the
+    # generic Pipecat assistant so the two clients can share one server.
+    if agent_id is not None:
+        system_prompt = AGENTS.get(agent_id, AGENTS[DEFAULT_AGENT])["prompt"]
+    else:
+        system_prompt = SYSTEM_INSTRUCTION
     context = LLMContext(
         [
             {
@@ -264,17 +269,22 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
             pcs_map.pop(webrtc_connection.pc_id, None)
 
         # Run example function with SmallWebRTC transport arguments.
-        # agent_id (t0..t9) selects the persona + its default voice.
-        agent_id = request.get("agent_id", DEFAULT_AGENT)
-        if agent_id not in AGENTS:
+        # agent_id (t0..t9) selects a task persona + its default voice. Unity
+        # sends one; the plain web console doesn't, so a missing/empty agent_id
+        # means "generic Pipecat assistant" and the two clients coexist.
+        agent_id = request.get("agent_id") or None
+        if agent_id is not None and agent_id not in AGENTS:
             agent_id = DEFAULT_AGENT
         # Explicit non-empty voice in the offer overrides (testing); else use the
-        # agent's default voice from the registry.
+        # agent's default voice from the registry, or the global default when no
+        # agent_id was given.
         requested_voice = request.get("voice") or ""
         if requested_voice in ALLOWED_VOICES:
             voice = requested_voice
-        else:
+        elif agent_id is not None:
             voice = AGENTS[agent_id]["voice"]
+        else:
+            voice = DEFAULT_VOICE
         logger.info(f"New connection: agent_id={agent_id}, voice={voice}")
         background_tasks.add_task(run_bot, pipecat_connection, voice, agent_id)
 
