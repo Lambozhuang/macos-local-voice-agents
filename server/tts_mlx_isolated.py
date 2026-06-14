@@ -107,6 +107,13 @@ class TTSMLXIsolated(TTSService):
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
+        # True between writing a "generate" command and reading its terminal
+        # done/error line. If an interruption cancels run_tts before we drain the
+        # worker's remaining segments, this stays True so the next run_tts resyncs
+        # by draining the stale lines first (the worker handles commands serially,
+        # emitting exactly one done/error per generate).
+        self._generation_pending = False
+
         # Use clause-aware aggregator so synthesis starts after the first clause
         # (e.g. "Hello," → TTS) rather than waiting for a full sentence.
         self._text_aggregator = ClauseTextAggregator(aggregation_type=AggregationType.SENTENCE)
@@ -156,30 +163,44 @@ class TTSMLXIsolated(TTSService):
             logger.error(f"Failed to start worker: {e}")
             return False
 
-    def _send_command(self, command: dict) -> dict:
-        """Send command to worker and get response."""
-        import select as _select
-        import time
+    def _write_command(self, command: dict) -> dict | None:
+        """Ensure the worker is alive and write one command to its stdin.
 
+        Returns None on success, or an {"error": ...} dict if the worker can't
+        be started or the write fails.
+        """
         try:
             if not self._process or self._process.poll() is not None:
                 logger.debug("Starting worker process...")
                 if not self._start_worker():
                     return {"error": "Failed to start worker"}
 
-            # Send command
             cmd_json = json.dumps(command) + "\n"
             logger.debug(f"Sending command: {command}")
             self._process.stdin.write(cmd_json)
             self._process.stdin.flush()
+            return None
+        except Exception as e:
+            logger.error(f"Worker communication error: {e}")
+            return {"error": str(e)}
 
-            # Read response, skipping blank/non-JSON lines the subprocess may emit
-            # (e.g. MLX Metal kernel compilation output or tqdm artefacts).
-            # Use a per-line timeout that resets on each readable line so the total
-            # wall-clock budget is generous enough for first-time model loading.
-            timeout = 60.0
+    def _read_json_line(self, timeout: float = 60.0) -> dict:
+        """Read one JSON object from the worker's stdout.
+
+        Skips blank/non-JSON lines the subprocess may emit (MLX Metal kernel
+        compilation output, tqdm artefacts). The timeout is a per-line wall-clock
+        budget that's generous enough for first-time model loading; it resets on
+        each readable line. Returns an {"error": ...} dict on timeout / EOF /
+        dead process so callers can handle every case uniformly.
+        """
+        import select as _select
+        import time
+
+        try:
+            if not self._process or self._process.poll() is not None:
+                return {"error": "Worker process died"}
+
             deadline = time.monotonic() + timeout
-
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -205,9 +226,9 @@ class TTSMLXIsolated(TTSService):
                     logger.debug(f"Skipping non-JSON worker output: {response_line!r}")
                     continue
 
-                if "audio" in response_data:
+                if "segment" in response_data:
                     logger.debug(
-                        f"Worker response: success with {len(response_data.get('audio', ''))} chars of audio data"
+                        f"Worker segment: {len(response_data.get('segment', ''))} chars of audio data"
                     )
                 else:
                     logger.debug(f"Worker response: {response_line}")
@@ -216,6 +237,27 @@ class TTSMLXIsolated(TTSService):
         except Exception as e:
             logger.error(f"Worker communication error: {e}")
             return {"error": str(e)}
+
+    def _send_command(self, command: dict) -> dict:
+        """Send a single-response command (e.g. init) and return its reply."""
+        err = self._write_command(command)
+        if err is not None:
+            return err
+        return self._read_json_line()
+
+    async def _drain_pending_generation(self, loop) -> None:
+        """Discard a prior generation's leftover output up to its done/error line.
+
+        Called when run_tts was cancelled (e.g. user interruption) mid-stream and
+        left unread segments in the pipe. Reads are bounded by _read_json_line's
+        timeout; a dead/timed-out worker just clears the flag so we don't loop.
+        """
+        while self._generation_pending:
+            msg = await loop.run_in_executor(None, self._read_json_line)
+            if "error" in msg or msg.get("done"):
+                self._generation_pending = False
+                return
+            # else: a leftover {"segment": ...} (or noise) — keep draining.
 
     async def _initialize_if_needed(self) -> bool:
         """Initialize the worker if not already done. Safe to call concurrently."""
@@ -268,28 +310,59 @@ class TTSMLXIsolated(TTSService):
             if not await self._initialize_if_needed():
                 raise RuntimeError("Failed to initialize Kokoro worker")
 
-            # Generate audio
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, self._send_command, {"cmd": "generate", "text": text}
+
+            # If a prior generation was interrupted before we drained its output,
+            # consume the leftover segments + terminal line now so reads stay in
+            # sync with commands. The worker is serial, so this just discards the
+            # stale tail; it can't start our new clause until it's drained anyway.
+            if self._generation_pending:
+                await self._drain_pending_generation(loop)
+
+            # Kick off generation. The worker streams back one JSON line per audio
+            # segment ({"segment": <b64>}), then a final {"done": true}; on failure
+            # it emits {"error": ...}. We read and play each segment as it arrives
+            # so first audio lands after the first segment, not the whole clause.
+            #
+            # Set the pending flag *before* the write so that a cancellation during
+            # the write executor (after the command reaches the worker) still leaves
+            # us knowing output is coming and drains it next turn. Reset it if the
+            # write fails, since then no output will be produced.
+            self._generation_pending = True
+            err = await loop.run_in_executor(
+                None, self._write_command, {"cmd": "generate", "text": text}
             )
+            if err is not None:
+                self._generation_pending = False
+                raise RuntimeError(f"Audio generation failed: {err.get('error')}")
 
-            if not result.get("success"):
-                raise RuntimeError(f"Audio generation failed: {result.get('error')}")
-
-            # Decode audio
-            audio_b64 = result["audio"]
-            audio_bytes = base64.b64decode(audio_b64)
-
-            await self.stop_ttfb_metrics()
-
-            # Stream audio
             CHUNK_SIZE = self.chunk_size
-            for i in range(0, len(audio_bytes), CHUNK_SIZE):
-                chunk = audio_bytes[i : i + CHUNK_SIZE]
-                if len(chunk) > 0:
-                    yield TTSAudioRawFrame(chunk, self.sample_rate, 1)
-                    await asyncio.sleep(0.001)
+            first_segment = True
+            while True:
+                msg = await loop.run_in_executor(None, self._read_json_line)
+
+                if "error" in msg:
+                    self._generation_pending = False
+                    raise RuntimeError(f"Audio generation failed: {msg.get('error')}")
+                if msg.get("done"):
+                    self._generation_pending = False
+                    break
+                if "segment" not in msg:
+                    # Unexpected message; skip rather than stall the turn.
+                    logger.debug(f"Ignoring unexpected worker message: {msg}")
+                    continue
+
+                audio_bytes = base64.b64decode(msg["segment"])
+                if first_segment:
+                    # First audio is now available — stop the TTFB timer here.
+                    await self.stop_ttfb_metrics()
+                    first_segment = False
+
+                for i in range(0, len(audio_bytes), CHUNK_SIZE):
+                    chunk = audio_bytes[i : i + CHUNK_SIZE]
+                    if len(chunk) > 0:
+                        yield TTSAudioRawFrame(chunk, self.sample_rate, 1)
+                        await asyncio.sleep(0.001)
 
         except Exception as e:
             logger.error(f"Error in run_tts: {e}")

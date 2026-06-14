@@ -49,40 +49,47 @@ class Worker:
             return {"error": str(e)}
     
     def generate(self, text):
+        """Stream audio to stdout one segment at a time.
+
+        Each segment Kokoro yields is emitted immediately as its own JSON line
+        ({"segment": <b64 PCM16>}), so the service can start playback after the
+        first segment instead of waiting for the whole clause to synthesize.
+        A final {"done": true} marks the end; errors emit {"error": ...}.
+        Prints directly rather than returning, so the caller must not re-print.
+        """
         try:
             if not self.model:
-                return {"error": "Not initialized"}
-            
-            segments = []
+                print(json.dumps({"error": "Not initialized"}), flush=True)
+                return
+
+            had_signal = False
             for result in self.model.generate(text=text, voice=self.voice, speed=1.0):
                 # Convert MLX array to numpy immediately
                 audio_data = np.array(result.audio, copy=True)
-                print(f"Generated segment shape: {audio_data.shape}, min: {audio_data.min():.4f}, max: {audio_data.max():.4f}", file=sys.stderr)
-                segments.append(audio_data)
-            
-            if not segments:
-                return {"error": "No audio"}
-                
-            # Concatenate all segments
-            if len(segments) == 1:
-                audio = segments[0]
-            else:
-                audio = np.concatenate(segments, axis=0)
-            
-            print(f"Final audio shape: {audio.shape}, min: {audio.min():.4f}, max: {audio.max():.4f}", file=sys.stderr)
-            
-            # Check if audio is silent
-            if np.max(np.abs(audio)) < 1e-6:
-                return {"error": "Generated audio is silent"}
-            
-            # Convert to 16-bit PCM
-            audio_int16 = (audio * 32767).astype(np.int16)
-            audio_b64 = base64.b64encode(audio_int16.tobytes()).decode()
-            
-            return {"success": True, "audio": audio_b64}
+                if audio_data.size == 0:
+                    continue
+                print(
+                    f"Generated segment shape: {audio_data.shape}, min: {audio_data.min():.4f}, max: {audio_data.max():.4f}",
+                    file=sys.stderr,
+                )
+                if float(np.max(np.abs(audio_data))) >= 1e-6:
+                    had_signal = True
+
+                # Convert to 16-bit PCM and stream this segment out now.
+                audio_int16 = (audio_data * 32767).astype(np.int16)
+                audio_b64 = base64.b64encode(audio_int16.tobytes()).decode()
+                print(json.dumps({"segment": audio_b64}), flush=True)
+
+            if not had_signal:
+                # No segments, or everything was silent — surface as an error so
+                # the service raises rather than playing nothing.
+                print(json.dumps({"error": "No audio"}), flush=True)
+                return
+
+            print(json.dumps({"done": True}), flush=True)
         except Exception as e:
             import traceback
-            return {"error": f"{str(e)}\n{traceback.format_exc()}"}
+            print(json.dumps({"error": f"{str(e)}\n{traceback.format_exc()}"}), flush=True)
 
 
 def main():
@@ -93,12 +100,14 @@ def main():
         try:
             req = json.loads(line.strip())
             if req["cmd"] == "init":
+                # init returns a single response dict (printed here).
                 resp = worker.initialize(req["model"], req["voice"])
+                print(json.dumps(resp), flush=True)
             elif req["cmd"] == "generate":
-                resp = worker.generate(req["text"])
+                # generate streams its own JSON lines (segments + done/error).
+                worker.generate(req["text"])
             else:
-                resp = {"error": "Unknown command"}
-            print(json.dumps(resp), flush=True)
+                print(json.dumps({"error": "Unknown command"}), flush=True)
         except Exception as e:
             print(json.dumps({"error": str(e)}), flush=True)
 

@@ -71,9 +71,18 @@ class Worker:
             return {"error": str(e)}
 
     def generate(self, text):
+        """Emit audio over stdout using the streaming protocol.
+
+        Marvis needs the whole buffer for RMS normalization, so it can't stream
+        mid-generation like Kokoro; it concatenates, normalizes, then emits the
+        result as a single {"segment": <b64>} line followed by {"done": true}.
+        This keeps it protocol-compatible with the service (segment/done/error).
+        Prints directly rather than returning, so the caller must not re-print.
+        """
         try:
             if not self.model:
-                return {"error": "Not initialized"}
+                print(json.dumps({"error": "Not initialized"}), flush=True)
+                return
 
             segments = []
             for result in self.model.generate(text=text, voice=self.voice, speed=1.0):
@@ -86,7 +95,8 @@ class Worker:
                 segments.append(audio_data)
 
             if not segments:
-                return {"error": "No audio"}
+                print(json.dumps({"error": "No audio"}), flush=True)
+                return
 
             # Concatenate all segments
             if len(segments) == 1:
@@ -116,17 +126,19 @@ class Worker:
 
             # Check if audio is silent
             if np.max(np.abs(audio)) < 1e-6:
-                return {"error": "Generated audio is silent"}
+                print(json.dumps({"error": "Generated audio is silent"}), flush=True)
+                return
 
             # Convert to 16-bit PCM
             audio_int16 = (audio * 32767).astype(np.int16)
             audio_b64 = base64.b64encode(audio_int16.tobytes()).decode()
 
-            return {"success": True, "audio": audio_b64}
+            print(json.dumps({"segment": audio_b64}), flush=True)
+            print(json.dumps({"done": True}), flush=True)
         except Exception as e:
             import traceback
 
-            return {"error": f"{str(e)}\n{traceback.format_exc()}"}
+            print(json.dumps({"error": f"{str(e)}\n{traceback.format_exc()}"}), flush=True)
 
 
 def main():
@@ -137,12 +149,14 @@ def main():
         try:
             req = json.loads(line.strip())
             if req["cmd"] == "init":
+                # init returns a single response dict (printed here).
                 resp = worker.initialize(req["model"], req["voice"])
+                print(json.dumps(resp), flush=True)
             elif req["cmd"] == "generate":
-                resp = worker.generate(req["text"])
+                # generate streams its own JSON lines (segment + done/error).
+                worker.generate(req["text"])
             else:
-                resp = {"error": "Unknown command"}
-            print(json.dumps(resp), flush=True)
+                print(json.dumps({"error": "Unknown command"}), flush=True)
         except Exception as e:
             print(json.dumps({"error": str(e)}), flush=True)
 
