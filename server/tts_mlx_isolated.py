@@ -20,6 +20,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
 )
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 from pipecat.utils.tracing.service_decorators import traced_tts
 
@@ -37,7 +38,11 @@ class TTSMLXIsolated(TTSService):
         **kwargs,
     ):
         """Initialize the isolated Kokoro TTS service."""
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=TTSSettings(model=model, voice=voice, language=None),
+            **kwargs,
+        )
 
         self._model_name = model
         self._voice = voice
@@ -49,7 +54,7 @@ class TTSMLXIsolated(TTSService):
         # Get path to worker script
         self._worker_script = self._get_worker_script_path()
 
-        self._settings = {
+        self._mlx_settings = {
             "model": model,
             "voice": voice,
             "sample_rate": sample_rate,
@@ -93,6 +98,9 @@ class TTSMLXIsolated(TTSService):
 
     def _send_command(self, command: dict) -> dict:
         """Send command to worker and get response."""
+        import select as _select
+        import time
+
         try:
             if not self._process or self._process.poll() is not None:
                 logger.debug("Starting worker process...")
@@ -105,41 +113,48 @@ class TTSMLXIsolated(TTSService):
             self._process.stdin.write(cmd_json)
             self._process.stdin.flush()
 
-            # Read response with timeout
-            import select
+            # Read response, skipping blank/non-JSON lines the subprocess may emit
+            # (e.g. MLX Metal kernel compilation output or tqdm artefacts).
+            # Use a per-line timeout that resets on each readable line so the total
+            # wall-clock budget is generous enough for first-time model loading.
+            timeout = 60.0
+            deadline = time.monotonic() + timeout
 
-            ready, _, _ = select.select([self._process.stdout], [], [], 10.0)  # 10 second timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"error": "Worker response timeout"}
 
-            if not ready:
-                return {"error": "Worker response timeout"}
+                ready, _, _ = _select.select([self._process.stdout], [], [], remaining)
+                if not ready:
+                    return {"error": "Worker response timeout"}
 
-            response_line = self._process.stdout.readline()
-            if not response_line:
-                # Check if process died
-                if self._process.poll() is not None:
-                    stderr_output = self._process.stderr.read() if self._process.stderr else ""
-                    return {"error": f"Worker process died. stderr: {stderr_output}"}
-                return {"error": "No response from worker"}
+                response_line = self._process.stdout.readline()
+                if not response_line:
+                    if self._process.poll() is not None:
+                        return {"error": "Worker process died"}
+                    return {"error": "No response from worker"}
 
-            response_data = json.loads(response_line.strip())
-            # Don't log the full response if it contains audio data (too verbose)
-            if "audio" in response_data:
-                logger.debug(
-                    f"Worker response: success with {len(response_data.get('audio', ''))} chars of audio data"
-                )
-            else:
-                logger.debug(f"Worker response: {response_line.strip()}")
-            return response_data
+                response_line = response_line.strip()
+                if not response_line:
+                    continue  # skip blank lines emitted during model loading
+
+                try:
+                    response_data = json.loads(response_line)
+                except json.JSONDecodeError:
+                    logger.debug(f"Skipping non-JSON worker output: {response_line!r}")
+                    continue
+
+                if "audio" in response_data:
+                    logger.debug(
+                        f"Worker response: success with {len(response_data.get('audio', ''))} chars of audio data"
+                    )
+                else:
+                    logger.debug(f"Worker response: {response_line}")
+                return response_data
 
         except Exception as e:
             logger.error(f"Worker communication error: {e}")
-            # Get stderr if available
-            if self._process and self._process.stderr:
-                try:
-                    stderr_output = self._process.stderr.read()
-                    logger.error(f"Worker stderr: {stderr_output}")
-                except:
-                    pass
             return {"error": str(e)}
 
     async def _initialize_if_needed(self):
@@ -173,7 +188,7 @@ class TTSMLXIsolated(TTSService):
         return True
 
     @traced_tts
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate speech using isolated worker process."""
         logger.debug(f"{self}: Generating TTS [{text}]")
 
