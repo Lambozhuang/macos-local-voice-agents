@@ -27,6 +27,8 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 
 from tts_mlx_isolated import TTSMLXIsolated
 
@@ -74,9 +76,7 @@ async def run_bot(webrtc_connection):
         api_key="dummyKey",
         base_url="http://127.0.0.1:1234/v1",
         settings=OpenAILLMService.Settings(
-            model="gemma-3n-e4b-it-text",  # Small model. Uses ~4GB of RAM.
-            # model="google/gemma-3-12b",  # Medium-sized model. Uses ~8.5GB of RAM.
-            # model="mlx-community/Qwen3-235B-A22B-Instruct-2507-3bit-DWQ", # Large model. Uses ~110GB of RAM!
+            model="local-model",  # LM Studio ignores this; uses whatever is loaded
             max_tokens=4096,
         ),
     )
@@ -114,13 +114,30 @@ async def run_bot(webrtc_connection):
         ]
     )
 
+    latency_observer = UserBotLatencyObserver()
+
+    @latency_observer.event_handler("on_first_bot_speech_latency")
+    async def on_first_bot_speech_latency(observer, latency_secs):
+        logger.info(f"⏱  First bot speech: {latency_secs:.3f}s after client connect")
+
+    @latency_observer.event_handler("on_latency_measured")
+    async def on_latency_measured(observer, latency_secs):
+        logger.info(f"⏱  User→bot latency: {latency_secs:.3f}s")
+
+    @latency_observer.event_handler("on_latency_breakdown")
+    async def on_latency_breakdown(observer, breakdown):
+        events = breakdown.chronological_events()
+        if events:
+            lines = "\n    ".join(events)
+            logger.info(f"⏱  Breakdown:\n    {lines}")
+
     task = PipelineWorker(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        observers=[RTVIObserver(rtvi)],
+        observers=[RTVIObserver(rtvi), latency_observer, MetricsLogObserver()],
     )
 
     @rtvi.event_handler("on_client_ready")
