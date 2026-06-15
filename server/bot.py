@@ -138,16 +138,76 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str |
     async def on_first_bot_speech_latency(observer, latency_secs):
         logger.info(f"⏱  First bot speech: {latency_secs:.3f}s after client connect")
 
+    # Stash the most recent total so the breakdown handler (which fires right
+    # after, in the same cycle) can show total + accounted + the gap together.
+    last_latency = {"total": None}
+
     @latency_observer.event_handler("on_latency_measured")
     async def on_latency_measured(observer, latency_secs):
+        last_latency["total"] = latency_secs
         logger.info(f"⏱  User→bot latency: {latency_secs:.3f}s")
 
     @latency_observer.event_handler("on_latency_breakdown")
     async def on_latency_breakdown(observer, breakdown):
-        events = breakdown.chronological_events()
-        if events:
-            lines = "\n    ".join(events)
-            logger.info(f"⏱  Breakdown:\n    {lines}")
+        # The default chronological_events() lists every stage flat, but the
+        # stages don't sum to the total: STT runs *inside* the user-turn window
+        # (user_turn_secs already includes VAD + STT finalization + turn detect),
+        # so STT TTFB overlaps "User turn" rather than adding to it. We instead
+        # nest in-turn stages under "User turn" and sum only the sequential ones.
+        turn_start = breakdown.user_turn_start_time
+        turn_secs = breakdown.user_turn_secs
+        # Midpoint of the user-turn window: a stage that STARTS before it is
+        # in-turn (e.g. STT, which starts at turn-start); stages after it (LLM,
+        # TTS) are sequential. STT starts at turn-start and the LLM at turn-end,
+        # so the midpoint separates them with ~half-a-turn of margin either way.
+        turn_mid = (
+            turn_start + turn_secs / 2
+            if turn_start is not None and turn_secs is not None
+            else None
+        )
+
+        def in_turn(start):
+            return turn_mid is not None and start < turn_mid
+
+        # rows: (start_time, label, add_secs) — add_secs counts toward the sum.
+        rows = []
+        if turn_start is not None and turn_secs is not None:
+            rows.append(
+                (turn_start, f"User turn: {turn_secs:.3f}s  (VAD + STT + turn detect)", turn_secs)
+            )
+
+        for t in breakdown.ttfb:
+            if in_turn(t.start_time):
+                rows.append(
+                    (t.start_time, f"  └ {t.processor}: TTFB {t.duration_secs:.3f}s  (within user turn)", 0.0)
+                )
+            else:
+                rows.append((t.start_time, f"{t.processor}: TTFB {t.duration_secs:.3f}s", t.duration_secs))
+
+        if breakdown.text_aggregation:
+            ta = breakdown.text_aggregation
+            prefix, add = ("  └ ", 0.0) if in_turn(ta.start_time) else ("", ta.duration_secs)
+            suffix = "  (within user turn)" if in_turn(ta.start_time) else ""
+            rows.append(
+                (ta.start_time, f"{prefix}{ta.processor}: text aggregation {ta.duration_secs:.3f}s{suffix}", add)
+            )
+
+        for fc in breakdown.function_calls:
+            rows.append((fc.start_time, f"{fc.function_name}: {fc.duration_secs:.3f}s", fc.duration_secs))
+
+        if not rows:
+            return
+
+        rows.sort(key=lambda r: r[0])
+        accounted = sum(r[2] for r in rows)
+        body = "\n    ".join(r[1] for r in rows)
+
+        total = last_latency["total"]
+        if total is not None:
+            footer = f"━ {accounted:.3f}s accounted, {total:.3f}s total (other {total - accounted:+.3f}s)"
+        else:
+            footer = f"━ {accounted:.3f}s accounted"
+        logger.info(f"⏱  Breakdown:\n    {body}\n    {footer}")
 
     task = PipelineWorker(
         pipeline,
