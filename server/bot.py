@@ -15,6 +15,10 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -107,10 +111,24 @@ async def run_bot(webrtc_connection, voice: str = DEFAULT_VOICE, agent_id: str |
             }
         ],
     )
+    # Turn detection: keep the default start strategies (VAD + transcription) and
+    # the default smart-turn V3 stop analyzer, but lower its silence fallback from
+    # the library default of 3s to 1s. That fallback only fires when the model
+    # predicts the user is mid-thought (INCOMPLETE) and they then go silent — so
+    # 1s ends those turns sooner at the cost of cutting off genuine long pauses.
+    # Turns the model scores COMPLETE are unaffected (they end in ~tens of ms).
+    user_turn_strategies = UserTurnStrategies(
+        stop=[
+            TurnAnalyzerUserTurnStopStrategy(
+                turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=1.0)),
+            ),
+        ],
+    )
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            user_turn_strategies=user_turn_strategies,
         ),
     )
 
