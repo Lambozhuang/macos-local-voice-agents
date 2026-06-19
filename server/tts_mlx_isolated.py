@@ -111,7 +111,10 @@ class TTSMLXIsolated(TTSService):
         # done/error line. If an interruption cancels run_tts before we drain the
         # worker's remaining segments, this stays True so the next run_tts resyncs
         # by draining the stale lines first (the worker handles commands serially,
-        # emitting exactly one done/error per generate).
+        # emitting exactly one done/error per generate). It is set *inside*
+        # _write_command, the instant the bytes are handed to the worker — NOT
+        # before the executor runs — so a cancel that lands before the write can't
+        # strand the flag and wedge the next turn's drain on an idle worker.
         self._generation_pending = False
 
         # Use clause-aware aggregator so synthesis starts after the first clause
@@ -177,6 +180,13 @@ class TTSMLXIsolated(TTSService):
 
             cmd_json = json.dumps(command) + "\n"
             logger.debug(f"Sending command: {command}")
+            # Mark a generation pending the instant we commit its bytes to the
+            # worker, so the next turn knows to drain this generation's output.
+            # Setting it here (rather than before the run_in_executor that calls
+            # us) means a cancel landing before the write leaves the flag False —
+            # the worker was never told to generate, so there's nothing to drain.
+            if command.get("cmd") == "generate":
+                self._generation_pending = True
             self._process.stdin.write(cmd_json)
             self._process.stdin.flush()
             return None
@@ -245,15 +255,30 @@ class TTSMLXIsolated(TTSService):
             return err
         return self._read_json_line()
 
+    # How long a single drain read waits before we give up and assume the worker
+    # has nothing more to send. The leftover tail of a real generation arrives
+    # immediately (the worker already computed it), so a short budget is ample;
+    # this is deliberately far below _read_json_line's 60s default so a stranded
+    # pending flag self-heals within one turn instead of stalling the whole turn.
+    _DRAIN_READ_TIMEOUT = 2.0
+
     async def _drain_pending_generation(self, loop) -> None:
         """Discard a prior generation's leftover output up to its done/error line.
 
         Called when run_tts was cancelled (e.g. user interruption) mid-stream and
-        left unread segments in the pipe. Reads are bounded by _read_json_line's
-        timeout; a dead/timed-out worker just clears the flag so we don't loop.
+        left unread segments in the pipe. Each read is bounded by a short timeout:
+        a real leftover tail arrives at once, so if a read times out we assume
+        there is nothing to drain (e.g. the flag was set but the worker never
+        actually produced output) and clear the flag rather than looping. This
+        makes a wedged state self-clear in one turn instead of blocking until the
+        next interruption re-arms it.
         """
         while self._generation_pending:
-            msg = await loop.run_in_executor(None, self._read_json_line)
+            # A read timeout comes back as {"error": "Worker response timeout"},
+            # so the error/done branch below also handles "nothing left to drain".
+            msg = await loop.run_in_executor(
+                None, self._read_json_line, self._DRAIN_READ_TIMEOUT
+            )
             if "error" in msg or msg.get("done"):
                 self._generation_pending = False
                 return
@@ -324,11 +349,10 @@ class TTSMLXIsolated(TTSService):
             # it emits {"error": ...}. We read and play each segment as it arrives
             # so first audio lands after the first segment, not the whole clause.
             #
-            # Set the pending flag *before* the write so that a cancellation during
-            # the write executor (after the command reaches the worker) still leaves
-            # us knowing output is coming and drains it next turn. Reset it if the
-            # write fails, since then no output will be produced.
-            self._generation_pending = True
+            # _write_command sets _generation_pending the instant it writes the
+            # bytes (and only for a "generate"), so a cancel before the write can't
+            # leave the flag stranded True against a worker that was never asked to
+            # generate. Reset it if the write fails, since then no output will come.
             err = await loop.run_in_executor(
                 None, self._write_command, {"cmd": "generate", "text": text}
             )
