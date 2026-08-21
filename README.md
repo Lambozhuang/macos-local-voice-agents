@@ -1,93 +1,53 @@
-# Local voice agents on macOS with Pipecat
+# macOS local voice-agent server (thesis fork)
 
-![screenshot](assets/debug-console-screenshot.png)
+The voice-agent server used in the master's thesis *The Impact of Network Degradation on
+Quality of Experience in Real-Time Conversation with LLM-powered Virtual Agents* (KTH).
+It runs the entire realtime voice pipeline — VAD, turn detection, speech recognition,
+LLM, speech synthesis — locally on one Mac and talks to a Unity XR client
+([iva-cui](https://github.com/Lambozhuang/iva-cui)) over serverless WebRTC.
 
-Pipecat is an open-source, vendor-neutral framework for building real-time voice (and video) AI applications.
+Forked from [kwindla/macos-local-voice-agents](https://github.com/kwindla/macos-local-voice-agents)
+(a Pipecat example of a fully local macOS voice agent). Main changes from upstream:
 
-This repository contains an example of a voice agent running with all local models on macOS. On an M-series mac, you can achieve voice-to-voice latency of <800 ms with relatively strong models.
+- **Multi-agent registry** (`server/agents_config.py`): ten personas (`t0`…`t9`, training +
+  city + hotel + museum roles), each a persona prompt + per-agent FACTS block + a shared
+  style leash, with a per-agent Kokoro voice. The client selects the agent per connection
+  via `agent_id` in the `/api/offer` request; one server process serves them all.
+- The client is the Unity XR app instead of the upstream React console (`client/` keeps
+  the upstream debug console for testing without a headset).
 
-This bot runs on Pipecat 1.3.0. The [server/bot.py](server/bot.py) file uses these models:
+## Pipeline
 
-  - Silero VAD (`stop_secs=0.2`)
-  - smart-turn v3 for semantic end-of-turn detection
-  - MLX Whisper (`large-v3-turbo-q4`) for STT
-  - A local OpenAI-compatible LLM served by LM Studio (model-agnostic; e.g. Gemma 3n)
-  - Kokoro TTS (`Kokoro-82M`), run in an isolated subprocess
+One Pipecat (1.3.0, Python 3.12) process, all models local, port **7860**:
 
-Note on turn detection: in Pipecat 1.3.0, VAD and turn-taking moved out of
-`TransportParams` and into the user aggregator (`LLMUserAggregatorParams`). The
-VAD is configured explicitly; `LocalSmartTurnAnalyzerV3` is supplied
-*automatically* by the default `UserTurnStrategies` (its default stop strategy),
-so smart-turn is active without an explicit `turn_analyzer=` argument. This was
-verified against the Pipecat 1.3.0 source (`pipecat/turns/user_turn_strategies.py`,
-tag [`v1.3.0`](https://github.com/pipecat-ai/pipecat/tree/v1.3.0)); see also the
-[Pipecat docs](https://docs.pipecat.ai/server/utilities/smart-turn/smart-turn-overview).
+| Stage | Model |
+|---|---|
+| Voice activity detection | Silero VAD (`stop_secs=0.2`) |
+| End-of-turn detection | smart-turn v3.2 weights (`smart-turn-v3.2-cpu.onnx`; the class is named V3), CPU, 1.0 s limit |
+| Speech recognition | MLX Whisper `large-v3-turbo` (4-bit) |
+| Language model | via LM Studio at `127.0.0.1:1234` (study: Meta-Llama-3.1-8B-Instruct Q5_K_M) |
+| Speech synthesis | Kokoro-82M (bf16) at 24 kHz mono, isolated subprocess, one voice embedding per agent |
 
-But you can swap any of them out for other models, or completely reconfigure the pipeline. It's easy to add tool calling, MCP server integrations, use parallel pipelines to do async inference alongside the voice conversations, add custom processing steps, configure interrupt handling to work differently, etc.
+Transport is Pipecat's `SmallWebRTCTransport` (aiortc): Opus audio both ways plus an RTVI
+data channel with live transcripts, speaking on/off events and per-stage metrics.
+Signaling is a single `POST /api/offer`; the agent greets only after the client sends
+`client-ready`. No cloud, no API keys.
 
-The bot and web client here communicate using a low-latency, local, serverless WebRTC connection. For more information on serverless WebRTC, see the Pipecat [SmallWebRTCTransport docs](https://docs.pipecat.ai/server/services/transport/small-webrtc) and this [article](https://www.daily.co/blog/you-dont-need-a-webrtc-server-for-your-voice-agents/). You could switch over to a different Pipecat transport (for example, a WebSocket-based transport), but WebRTC is the best choice for realtime audio.
+Note on Pipecat 1.3.0 turn-taking: VAD and turn-taking are configured on the user
+aggregator (`LLMUserAggregatorParams`), and `LocalSmartTurnAnalyzerV3` is supplied
+automatically by the default `UserTurnStrategies` — smart-turn is active without an
+explicit `turn_analyzer=` argument.
 
-For a deep dive into voice AI, including network transport, optimizing for latency, and notes on designing tool calling and complex workflows, see the [Voice AI & Voice Agents Illustrated Guide](https://voiceaiandvoiceagents.com/).
+## Running
 
-# Models and dependencies
-
-Silero VAD and MLX Whisper run inside the Pipecat process. When the agent code starts, it will need to download model weights that aren't already cached, so first startup can take some time.
-
-The LLM service in this bot uses the OpenAI-compatible chat completion HTTP API. So you will need to run a local OpenAI-compatible LLM server. 
-
-One easy, high-performance, way to run a local LLM server on macOS is [LM Studio](https://lmstudio.ai/). From inside the LM Studio graphical interface, go to the "Developer" tab on the far left to start an HTTP server.
-
-# Run the voice agent
-
-The core voice agent code lives in a single file: [server/bot.py](server/bot.py). There's one custom service here that's not included in Pipecat core: we implemented a local MLX-Audio frame processor on top of the excellent [mlx-audio library](https://github.com/Blaizzy/mlx-audio).
-
-Note that the first time you start the bot it will take some time to initialize the three models. It can be 30 seconds or more before the bot is fully ready to go. Subsequent startups will be much faster.
-
-It's not a bad idea to run a quick `mlx-audio.generate` process from the command line before you run the bot the first time, so you're not waiting for a relatively bug HuggingFace model download for the voice model.
+1. Start an LM Studio server (Developer tab) on `127.0.0.1:1234` with your model loaded.
+2. Start the bot (first run downloads model weights and is slow):
 
 ```shell
-mlx-audio.generate --model "Marvis-AI/marvis-tts-250m-v0.1" --text "Hello, I'm Pipecat!" --output "output.wav"
-# or
-mlx-audio.generate --model "mlx-community/Kokoro-82M-bf16" --text "Hello, I'm Pipecat!" --output "output.wav"
+cd server
+HF_HUB_OFFLINE=1 uv run bot.py --host 0.0.0.0
 ```
 
-```shell
-cd server/
-```
-
-If you're using uv
-
-```
-uv run bot.py
-```
-
-If you're using pip
-
-```
-python3.12 -m venv venv
-source venv/bin/activate
-
-pip install -r requirements.txt
-
-python bot.py
-```
-
-After you run the first time and have all the models cached, you can set the HF_HUB_OFFLINE environment variable to prevent the Hugging Face libraries from going to the network and checking for model updates. This makes the initial bot startup and first conversation turn a lot faster.
-
-```
-HF_HUB_OFFLINE=1 uv run bot.py
-```
-
-# Start the web client
-
-The web client is a React app. You can connect to your local macOS agent using any client that can negotiate a serverless WebRTC connection. The client in this repo is based on [voice-ui-kit](https://github.com/pipecat-ai/voice-ui-kit) and just uses that library's standard debug console template.
-
-```shell
-cd client/
-
-npm i
-
-npm run dev
-
-# Navigate to URL shown in terminal in your web browser
-```
+`--host 0.0.0.0` is required for LAN clients (Unity). Leave `HF_HUB_OFFLINE` off for the
+very first run so the weights can download. For a quick test without the headset, run the
+debug web client: `cd client && npm i && npm run dev`.
