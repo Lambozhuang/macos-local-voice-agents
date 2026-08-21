@@ -25,7 +25,7 @@ One Pipecat (1.3.0, Python 3.12) process, all models local, port **7860**:
 | Voice activity detection | Silero VAD (`stop_secs=0.2`) |
 | End-of-turn detection | smart-turn v3.2 weights (`smart-turn-v3.2-cpu.onnx`; the class is named V3), CPU, 1.0 s limit |
 | Speech recognition | MLX Whisper `large-v3-turbo` (4-bit) |
-| Language model | via LM Studio at `127.0.0.1:1234` (study: Meta-Llama-3.1-8B-Instruct Q5_K_M) |
+| Language model | via LM Studio at `127.0.0.1:1234` (study: Meta-Llama-3.1-8B-Instruct Q5_K_M; context 8192, temperature 0.8, top-p 0.95, set in LM Studio) |
 | Speech synthesis | Kokoro-82M (bf16) at 24 kHz mono, isolated subprocess, one voice embedding per agent |
 
 Transport is Pipecat's `SmallWebRTCTransport` (aiortc): Opus audio both ways plus an RTVI
